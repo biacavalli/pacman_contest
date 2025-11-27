@@ -10,12 +10,11 @@ import random
 import util
 import time
 
-from captureAgents import CaptureAgent
+from capture_agents import CaptureAgent
 from game import Directions
 from game import Actions
-from util import nearestPoint
-from pacmanbuster import HybridInference
-
+from util import nearest_point
+# Removed: from pacmanbuster import HybridInference 
 
 #################
 # MCTS Implementation #
@@ -48,7 +47,7 @@ class MCTSNode:
 def simulate_game(state, agent_index, dead_ends=set(), depth_limit=20, is_offensive=True):
     """
     Rollout simulation.
-    Now accepts 'dead_ends' set to penalize entering dead ends defensively.
+    Includes logic for Dead Ends and Scared Survival Mode.
     """
     current_state = state
     initial_score = state.get_score()
@@ -79,23 +78,18 @@ def simulate_game(state, agent_index, dead_ends=set(), depth_limit=20, is_offens
             
             if is_offensive:
                 # ---------------- OFFENSIVE SIMULATION ----------------
-                # 1. ACTUAL SCORE (Deposited points)
                 score_gained = successor.get_score() - initial_score
                 if agent_index % 2 != 0: 
                     score_gained = -score_gained
                 
-                # 2. POTENTIAL SCORE (Carrying)
                 carrying_reward = new_state.num_carrying * 2.0
                 
-                # 3. DISTANCE TO FOOD (Hunting)
                 min_food_dist = 999
                 if food_list:
-                    min_food_dist = min([util.manhattanDistance(new_pos, f) for f in food_list])
+                    min_food_dist = min([util.manhattan_distance(new_pos, f) for f in food_list])
                 
-                # 4. DISTANCE HOME (Retreating)
                 dist_to_home = abs(new_pos[0] - home_x_max)
                 
-                # DYNAMIC HEURISTIC
                 if new_state.num_carrying > 0:
                     heuristic = (score_gained * 1000) + (carrying_reward * 10) - (dist_to_home * 5)
                 else:
@@ -103,49 +97,70 @@ def simulate_game(state, agent_index, dead_ends=set(), depth_limit=20, is_offens
 
             else:
                 # ---------------- DEFENSIVE SIMULATION ----------------
-                score_change = initial_score - successor.get_score()
-                if agent_index % 2 != 0: 
-                    score_change = -score_change
                 
-                # Check if we're scared
-                my_scared = new_state.scared_timer > 0
-                
-                # Get enemy positions
+                # Get enemy info
                 enemies = [successor.get_agent_state(i) for i in range(successor.get_num_agents()) 
                            if i % 2 != agent_index % 2]
                 invaders = [e for e in enemies if e.is_pacman and e.get_position() is not None]
                 
-                if my_scared and invaders:
-                    # Run away from invaders when scared
-                    min_invader_dist = min([util.manhattanDistance(new_pos, e.get_position()) for e in invaders])
-                    heuristic = (score_change * 100) + (min_invader_dist * 50)  # Maximize distance
-                elif invaders:
-                    # Chase invaders when not scared
-                    min_invader_dist = min([util.manhattanDistance(new_pos, e.get_position()) for e in invaders])
-                    heuristic = (score_change * 100) - (min_invader_dist * 10)  # Minimize distance
-                else:
-                    heuristic = score_change * 100
+                # Check if we are scared
+                my_scared = new_state.scared_timer > 0
                 
-                # ---------------- DEAD END CHECK ----------------
-                # Only enter a dead end if we are NOT scared and an invader is INSIDE it
-                if new_pos in dead_ends:
-                    invader_trapped = False
-                    if not my_scared:
-                        for inv in invaders:
-                            if inv.get_position() == new_pos:
-                                invader_trapped = True
-                                break
+                # ================= SCARED / SURVIVAL MODE =================
+                if my_scared:
+                    # 1. IMMEDIATE DEATH CHECK
+                    # If an invader is too close, this state is terrible.
+                    min_dist_to_invader = 9999
+                    if invaders:
+                        min_dist_to_invader = min([util.manhattan_distance(new_pos, e.get_position()) for e in invaders])
                     
-                    if not invader_trapped:
-                        heuristic -= 10000  # Massive Penalty for useless dead end
+                    if min_dist_to_invader <= 1:
+                        heuristic = -float('inf') # We got eaten!
+                    else:
+                        # 2. RUN AWAY (Maximize Distance)
+                        # We ignore score here. Survival is more important than defending food.
+                        heuristic = min_dist_to_invader * 200 
+                        
+                        # 3. DEAD ENDS ARE FATAL WHEN SCARED
+                        if new_pos in dead_ends:
+                            heuristic -= 100000 # Absolute prohibition on dead ends when scared
+                
+                # ================= NORMAL DEFENSE MODE =================
+                else:
+                    score_change = initial_score - successor.get_score()
+                    if agent_index % 2 != 0: 
+                        score_change = -score_change
+                    
+                    if invaders:
+                        # Chase invaders
+                        min_invader_dist = min([util.manhattan_distance(new_pos, e.get_position()) for e in invaders])
+                        heuristic = (score_change * 100) - (min_invader_dist * 10)
+                        
+                        # Dead End Logic (Aggressive):
+                        # Enter dead end ONLY if invader is inside
+                        if new_pos in dead_ends:
+                            invader_trapped = False
+                            for inv in invaders:
+                                if inv.get_position() == new_pos:
+                                    invader_trapped = True
+                                    break
+                            
+                            if not invader_trapped:
+                                heuristic -= 10000 # Don't enter useless dead ends
+                    else:
+                        heuristic = score_change * 100
+                        # Avoid dead ends when patrolling
+                        if new_pos in dead_ends:
+                            heuristic -= 1000
 
             if heuristic > best_score:
                 best_score = heuristic
                 best_action = action
         
-        if random.random() < 0.8 and best_action:
+        # Execute best action in simulation
+        if random.random() < 0.9 and best_action: # Increased greediness for stability
             current_state = current_state.generate_successor(agent_index, best_action)
-        else:
+        elif actions:
             current_state = current_state.generate_successor(agent_index, random.choice(actions))
             
     return current_state.get_score()
@@ -155,7 +170,6 @@ def run_mcts(root_state, agent_index, dead_ends=set(), is_offensive=True, time_l
     start_t = time.time()
     root = MCTSNode(root_state, agent_index)
     
-    # Loop until time runs out
     while time.time() - start_t < time_limit:
         node = root
         
@@ -175,8 +189,8 @@ def run_mcts(root_state, agent_index, dead_ends=set(), is_offensive=True, time_l
                     node = child
                     break
         
-        # Simulation (Pass dead_ends here)
-        reward = simulate_game(node.state, agent_index, dead_ends=dead_ends, depth_limit=10, is_offensive=is_offensive)
+        # Simulation
+        reward = simulate_game(node.state, agent_index, dead_ends=dead_ends, depth_limit=12, is_offensive=is_offensive)
         
         # Backpropagation
         while node is not None:
@@ -185,7 +199,6 @@ def run_mcts(root_state, agent_index, dead_ends=set(), is_offensive=True, time_l
             node = node.parent
     
     if root.children:
-        # Pick the most visited node (robust child)
         best = max(root.children, key=lambda n: n.visits)
         return best.action
     
@@ -198,11 +211,6 @@ def run_mcts(root_state, agent_index, dead_ends=set(), is_offensive=True, time_l
 
 def create_team(first_index, second_index, is_red,
                 first='OffensiveReflexAgent', second='DefensiveReflexAgent', num_training=0):
-    """
-    This function should return a list of two agents that will form the
-    team, initialized using firstIndex and secondIndex as their agent
-    index numbers.
-    """
     return [eval(first)(first_index), eval(second)(second_index)]
 
 
@@ -211,11 +219,6 @@ def create_team(first_index, second_index, is_red,
 ##########
 
 class ReflexCaptureAgent(CaptureAgent):
-    """
-    A base class for reflex agents that choose score-maximizing actions
-    Now using MCTS for decision making!
-    """
-
     def __init__(self, index, time_for_computing=.1):
         super().__init__(index, time_for_computing)
         self.start = None
@@ -226,14 +229,13 @@ class ReflexCaptureAgent(CaptureAgent):
 
     def choose_action(self, game_state):
         actions = game_state.get_legal_actions(self.index)
-        if not actions:
-            return Directions.STOP
-        return random.choice(actions)
+        return random.choice(actions) if actions else Directions.STOP
 
     def get_successor(self, game_state, action):
         successor = game_state.generate_successor(self.index, action)
         pos = successor.get_agent_state(self.index).get_position()
-        if pos != nearestPoint(pos):
+        if pos != nearest_point(pos):
+            # This is a hack for Pacman's movement when it passes a corner
             return successor.generate_successor(self.index, action)
         else:
             return successor
@@ -254,20 +256,12 @@ class ReflexCaptureAgent(CaptureAgent):
 
 
 class OffensiveReflexAgent(ReflexCaptureAgent):
-    """
-    An offensive agent using MCTS for intelligent food collection and scoring
-    """
-
     def choose_action(self, game_state):
-        # Use MCTS with offensive heuristic (default dead_ends=empty)
         action = run_mcts(game_state, self.index, is_offensive=True, time_limit=0.9)
-        
-        # Fallback if MCTS fails
         if action == Directions.STOP:
             actions = game_state.get_legal_actions(self.index)
             if actions:
                 return random.choice([a for a in actions if a != Directions.STOP])
-        
         return action
 
     def get_features(self, game_state, action):
@@ -311,73 +305,46 @@ class OffensiveReflexAgent(ReflexCaptureAgent):
 
 
 class DefensiveReflexAgent(ReflexCaptureAgent):
-    """
-    A defensive agent using MCTS that:
-      - Tracks visible and invisible invaders using hybrid inference
-      - Uses MCTS with DEAD END AVOIDANCE
-      - Runs away when scared
-    """
-
     def find_dead_ends(self, game_state):
-        """
-        Pre-computes all dead-end positions on the map.
-        A dead end is any position that is not a junction and leads to a dead end.
-        """
         layout = game_state.data.layout
         walls = layout.walls
         width, height = layout.width, layout.height
-        
-        # 1. Identify all non-wall positions
         non_walls = []
         for x in range(width):
             for y in range(height):
                 if not walls[x][y]:
                     non_walls.append((x, y))
-        
         dead_ends = set()
-        
-        # 2. Iteratively identify dead ends
         changed = True
         while changed:
             changed = False
             for pos in non_walls:
-                if pos in dead_ends:
-                    continue
-                
+                if pos in dead_ends: continue
                 x, y = pos
                 neighbors = [(x+1, y), (x-1, y), (x, y+1), (x, y-1)]
-                valid_neighbors = [
-                    n for n in neighbors 
-                    if not walls[n[0]][n[1]] and n not in dead_ends
-                ]
-                
-                # If it's a cul-de-sac (1 exit) or isolated (0 exits), it's a dead end
-                if len(valid_neighbors) <= 1:
+                valid_neighbors = [n for n in neighbors if not walls[n[0]][n[1]] and n not in dead_ends]
+                # A dead end is a non-wall tile with at most one non-wall neighbor
+                if len(valid_neighbors) <= 1: 
                     dead_ends.add(pos)
                     changed = True
-                    
         return dead_ends
 
     def register_initial_state(self, game_state):
         super().register_initial_state(game_state)
-        # Track opponents
-        self.trackers = {}
-        for enemy in self.get_opponents(game_state):
-            self.trackers[enemy] = HybridInference(enemy, game_state)
-            
-        # Pre-compute dead ends
+        # Removed: self.trackers = {} initialization
+        # Removed: Loop to initialize HybridInference trackers
         self.dead_ends = self.find_dead_ends(game_state)
 
     def choose_action(self, game_state):
-        # Update all inference models
-        for tracker in self.trackers.values():
-            tracker.observe(self, game_state)
-            tracker.elapse_time(game_state)
+        # Removed: Tracker observation and elapse_time calls
+        # for tracker in self.trackers.values():
+        #     tracker.observe(self, game_state)
+        #     tracker.elapse_time(game_state)
         
-        # Check if we're scared
+        # Check scared status for MCTS tuning
         my_state = game_state.get_agent_state(self.index)
         
-        # Run MCTS, passing the dead_ends set for avoidance
+        # Run MCTS
         action = run_mcts(game_state, self.index, 
                           dead_ends=self.dead_ends, 
                           is_offensive=False, 
@@ -387,7 +354,6 @@ class DefensiveReflexAgent(ReflexCaptureAgent):
             actions = game_state.get_legal_actions(self.index)
             if actions:
                 return random.choice([a for a in actions if a != Directions.STOP])
-        
         return action
 
     def get_features(self, game_state, action):
@@ -403,51 +369,37 @@ class DefensiveReflexAgent(ReflexCaptureAgent):
         visible = [e for e in enemies if e.is_pacman and e.get_position() is not None]
         features['num_invaders'] = len(visible)
 
-        # Inference
-        inferred_positions = []
-        if not visible:
-            for enemy, tracker in self.trackers.items():
-                dist = tracker.getBeliefDistribution()
-                pos = dist.argMax()
-                if dist[pos] > 0.15:
-                    inferred_positions.append(pos)
-
+        # Inferred positions logic has been simplified/removed, 
+        # so we only rely on visible invaders for targets.
+        inferred_positions = [] 
+        
         if scared_timer > 0:
-            targets = [e.get_position() for e in visible] if visible else inferred_positions
+            targets = [e.get_position() for e in visible] # Inferred positions are ignored when scared
             if targets:
                 dists = [self.get_maze_distance(my_pos, t) for t in targets]
                 features['scared_distance'] = -min(dists)
             
-            # Avoid dead ends when scared
             if my_pos in self.dead_ends:
                 features['in_dead_end'] = 1
                 
             if action == Directions.STOP:
                 features['stop'] = 1
-                
         else:
-            targets = [e.get_position() for e in visible] if visible else inferred_positions
-
+            targets = [e.get_position() for e in visible] # Inferred positions are now completely ignored
             if targets:
                 dists = [self.get_maze_distance(my_pos, t) for t in targets]
                 features['invader_distance'] = min(dists)
-                
-                # Block escape
                 border_x = successor.data.layout.width // 2
                 for t in targets:
                     if my_pos[0] > border_x and t[0] <= border_x:
                         features['block'] = 1
-
             else:
                 features['patrol'] = self.compute_patrol_priority(successor, my_pos)
 
-            # Avoid dead ends unless chasing
             if my_pos in self.dead_ends:
                 features['in_dead_end'] = 1
-
             if action == Directions.STOP:
                 features['stop'] = 1
-
             rev = Directions.REVERSE[game_state.get_agent_state(self.index).configuration.direction]
             if action == rev:
                 features['reverse'] = 1
@@ -458,31 +410,28 @@ class DefensiveReflexAgent(ReflexCaptureAgent):
         width = game_state.data.layout.width
         height = game_state.data.layout.height
         mid_x = width // 2
-        
         valid_border_targets = []
         for y in range(1, height - 1):
             pos = (mid_x, y)
-            # Use pre-computed dead ends for check
             if not game_state.has_wall(pos[0], pos[1]) and pos not in self.dead_ends:
                 valid_border_targets.append(pos)
 
-        if not valid_border_targets:
-            return 0 
+        if not valid_border_targets: return 0 
 
         food_defending = self.get_food_you_are_guarding(game_state).as_list()
         if food_defending:
-            valid_border_targets.sort(
-                key=lambda p: min(self.get_maze_distance(p, f) for f in food_defending)
-            )
+            # Sort border targets by proximity to the food we are guarding
+            valid_border_targets.sort(key=lambda p: min(self.get_maze_distance(p, f) for f in food_defending))
 
+        # Return distance to the best patrol spot
         return min(self.get_maze_distance(my_pos, p) for p in valid_border_targets)
 
     def get_weights(self, game_state, action):
         my_state = game_state.get_agent_state(self.index)
         if my_state.scared_timer > 0:
             return {
-                'scared_distance': 100,
-                'in_dead_end': -500,
+                'scared_distance': 200, # Highly prioritize running away
+                'in_dead_end': -5000, 	# Massive penalty for dead ends
                 'stop': -100,
                 'on_defense': 50
             }
