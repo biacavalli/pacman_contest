@@ -256,128 +256,206 @@ class ReflexCaptureAgent(CaptureAgent):
         return {'successor_score': 1.0}
 
 
-
 class OffensiveReflexAgent(ReflexCaptureAgent):
     """
-    A reflex agent that seeks food but knows when to run home.
+    Improved Offensive Agent: Hunts Scared Ghosts, Fixes Looping, and Safe Retreat.
     """
     
-    def get_boundary(self, game_state):
-        """
-        Finds the list of boundary coordinates on the home side.
-        """
+    def __init__(self, index):
+        ReflexCaptureAgent.__init__(self, index)
+        self.retreating = False 
+
+    def register_initial_state(self, game_state):
+        ReflexCaptureAgent.register_initial_state(self, game_state)
+        self.dead_ends = self.find_dead_ends(game_state)
+
+    def find_dead_ends(self, game_state):
+        walls = game_state.get_walls()
+        width = walls.width
+        height = walls.height
+        dead_ends = set()
+        candidates = []
+        for x in range(width):
+            for y in range(height):
+                if not walls[x][y]: candidates.append((x,y))
+
+        changed = True
+        while changed:
+            changed = False
+            for pos in candidates:
+                if pos in dead_ends: continue
+                x, y = pos
+                neighbors = [(x+1, y), (x-1, y), (x, y+1), (x, y-1)]
+                valid_exits = 0
+                for nx, ny in neighbors:
+                    if not walls[nx][ny] and (nx, ny) not in dead_ends:
+                        valid_exits += 1
+                if valid_exits <= 1:
+                    dead_ends.add(pos)
+                    changed = True
+        return dead_ends
+
+    def get_safe_distance_to_home(self, game_state, my_pos, dangerous_positions):
         layout = game_state.data.layout
         width = layout.width
-        height = layout.height
+        start_pos = (int(my_pos[0]), int(my_pos[1]))
+        queue = [(start_pos, 0)]
+        visited = set([start_pos])
         
-        # Red team (even index) home is on the left (x < width/2)
-        # Blue team (odd index) home is on the right (x >= width/2)
-        if self.index % 2 == 0:
-            x = (width // 2) - 1 
-        else:
-            x = (width // 2)
-            
-        boundary_nodes = []
-        for y in range(height):
-            if not layout.walls[x][y]:
-                boundary_nodes.append((x, y))
-        return boundary_nodes
+        if self.index % 2 == 0: home_x = (width // 2) - 1
+        else: home_x = (width // 2)
+
+        while queue:
+            curr, dist = queue.pop(0)
+            if (self.index % 2 == 0 and curr[0] <= home_x) or \
+               (self.index % 2 != 0 and curr[0] >= home_x):
+                return dist
+
+            x, y = curr
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nx, ny = int(x + dx), int(y + dy)
+                next_pos = (nx, ny)
+                if not layout.walls[nx][ny]:
+                    if next_pos not in visited and next_pos not in dangerous_positions:
+                        visited.add(next_pos)
+                        queue.append((next_pos, dist + 1))
+        return 9999 
 
     def choose_action(self, game_state):
         my_state = game_state.get_agent_state(self.index)
-        my_pos = my_state.get_position()
+        carrying = my_state.num_carrying
+        food_left = len(self.get_food(game_state).as_list())
         
-        # 1. SURVIVAL CHECK
-        # If we have food and a ghost is close, panic and use MCTS
+        # --- NEW LOGIC: Check for Scared Ghosts ---
+        # If there is a scared ghost nearby, CANCEL RETREAT immediately.
         enemies = [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]
-        ghosts = [a for a in enemies if not a.is_pacman and a.get_position() is not None]
-        if ghosts:
-            dists = [self.get_maze_distance(my_pos, g.get_position()) for g in ghosts]
-            # If carrying food and ghost is within 5 steps, calculate safe path
-            if my_state.num_carrying > 0 and min(dists) < 6:
-                return run_mcts(game_state, self.index, is_offensive=True, time_limit=0.07)
-            # If trapped
-            if min(dists) < 4 and len(game_state.get_legal_actions(self.index)) <= 2:
-                 return run_mcts(game_state, self.index, is_offensive=True, time_limit=0.07)
-
-        # 2. RETREAT LOGIC (The logic you were missing)
-        # If we have a lot of food, we might want to prioritize MCTS to find the safest way home
-        # rather than the quickest way, but Reflex is usually fine for navigation.
+        scared_ghosts = [a for a in enemies if a.is_pacman is False and a.get_position() and a.scared_timer > 5]
         
-        return super().choose_action(game_state)
+        if scared_ghosts:
+            self.retreating = False
+        else:
+            # Normal Retreat Logic
+            if not self.retreating:
+                if carrying >= 5 or (carrying > 0 and food_left <= 2):
+                    self.retreating = True
+            else:
+                if carrying == 0:
+                    self.retreating = False
+
+        # Emergency MCTS override (Only for ACTIVE ghosts)
+        active_ghosts = [a for a in enemies if not a.is_pacman and a.get_position() and a.scared_timer <= 5]
+        if active_ghosts and carrying > 0:
+             dists = [self.get_maze_distance(my_state.get_position(), g.get_position()) for g in active_ghosts]
+             if min(dists) <= 4:
+                 return run_mcts(game_state, self.index, is_offensive=True, time_limit=0.1)
+
+        return ReflexCaptureAgent.choose_action(self, game_state)
 
     def get_features(self, game_state, action):
         features = util.Counter()
         successor = self.get_successor(game_state, action)
         my_state = successor.get_agent_state(self.index)
         my_pos = my_state.get_position()
-        food_list = self.get_food(successor).as_list()
         
-        # --- Feature 1: Food ---
-        features['successor_score'] = -len(food_list)
-        if len(food_list) > 0:
-            min_distance = min([self.get_maze_distance(my_pos, food) for food in food_list])
-            features['distance_to_food'] = min_distance
-
-        # --- Feature 2: Returning Home ---
-        # We calculate distance to the nearest boundary point
-        boundary_nodes = self.get_boundary(game_state)
-        dist_to_home = min([self.get_maze_distance(my_pos, b) for b in boundary_nodes])
-        features['distance_to_home'] = dist_to_home
-        
-        # --- Feature 3: Ghosts ---
-        enemies = [successor.get_agent_state(i) for i in self.get_opponents(successor)]
-        ghosts = [a for a in enemies if not a.is_pacman and a.get_position() is not None]
-        if len(ghosts) > 0:
-            min_ghost_dist = min([self.get_maze_distance(my_pos, g.get_position()) for g in ghosts])
-            if min_ghost_dist < 5:
-                features['ghost_distance'] = min_ghost_dist
-        
-        # --- Feature 4: Mechanics ---
         if action == Directions.STOP: features['stop'] = 1
         rev = Directions.REVERSE[game_state.get_agent_state(self.index).configuration.direction]
         if action == rev: features['reverse'] = 1
 
+        # --- NEW LOGIC: Separating Ghosts ---
+        enemies = [successor.get_agent_state(i) for i in self.get_opponents(successor)]
+        
+        # 1. Active Ghosts (Danger) - Timer < 5
+        active_ghosts = [a for a in enemies if not a.is_pacman and a.get_position() and a.scared_timer <= 5]
+        
+        # 2. Scared Ghosts (Food!) - Timer > 5 (Buffer to avoid dying as timer ends)
+        scared_ghosts = [a for a in enemies if not a.is_pacman and a.get_position() and a.scared_timer > 5]
+
+        dangerous_spots = set()
+        
+        # Handle Danger
+        if active_ghosts:
+            dists = [self.get_maze_distance(my_pos, g.get_position()) for g in active_ghosts]
+            min_dist = min(dists)
+            if min_dist < 5:
+                features['ghost_proximity'] = 5 - min_dist 
+                
+            for g in active_ghosts:
+                g_pos = g.get_position()
+                ix, iy = int(g_pos[0]), int(g_pos[1])
+                dangerous_spots.add((ix, iy))
+
+        # Handle Scared Targets
+        if scared_ghosts:
+            # We want to minimize distance to the closest scared ghost
+            dists = [self.get_maze_distance(my_pos, g.get_position()) for g in scared_ghosts]
+            features['distance_to_scared_ghost'] = min(dists)
+
+        # Food Handling
+        if not self.retreating:
+            food_list = self.get_food(successor).as_list()
+            features['successor_score'] = -len(food_list)
+            if len(food_list) > 0:
+                features['distance_to_food'] = min([self.get_maze_distance(my_pos, food) for food in food_list])
+            
+            capsules = self.get_capsules(successor)
+            if capsules:
+                features['distance_to_capsule'] = min([self.get_maze_distance(my_pos, c) for c in capsules])
+
+        # Dead Ends (Only dangerous if ACTIVE ghosts are near)
+        if my_pos in self.dead_ends and active_ghosts:
+            dists = [self.get_maze_distance(my_pos, g.get_position()) for g in active_ghosts]
+            if min(dists) < 6:
+                features['in_dead_end'] = 1
+
+        # Return Home
+        # Note: We calculate this even if chasing ghosts, so we don't accidentally get trapped
+        if self.retreating or my_state.num_carrying > 0:
+            features['distance_to_home'] = self.get_safe_distance_to_home(successor, my_pos, dangerous_spots)
+
         return features
 
     def get_weights(self, game_state, action):
-        # Current status
-        my_state = game_state.get_agent_state(self.index)
-        carrying = my_state.num_carrying
-        
-        # Base weights (Hunting mode)
         weights = {
             'successor_score': 100,
             'distance_to_food': -1,
-            'distance_to_home': 0,      # Don't care about home yet
-            'ghost_distance': 200,      # Run from ghosts
+            'distance_to_capsule': -2,
+            'ghost_proximity': -1000, 
+            'in_dead_end': -500,
             'stop': -100,
-            'reverse': -2
+            'reverse': -2,
+            'distance_to_home': 0,
+            'distance_to_scared_ghost': 0 # Default 0
         }
-        
-        # --- DYNAMIC WEIGHTS ADJUSTMENT ---
-        
-        # 1. The "Greedy" Threshold
-        # If we have collected 2 or more dots, start thinking about home.
-        if carrying >= 2:
-            # We add a small pull towards home.
-            # This allows us to eat food if it's on the way, but generally drift back.
-            weights['distance_to_home'] = -2 
 
-        # 2. The "Deposit" Mode
-        # If we have 5+ dots, OR the game is almost over, stop hunting and RUN.
-        # Also if the nearest food is very far away, just go home and bank the points.
-        food_left = len(self.get_food(game_state).as_list())
+        # Check context
+        enemies = [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]
+        scared_ghosts = [a for a in enemies if not a.is_pacman and a.get_position() and a.scared_timer > 5]
+
+        # --- NEW LOGIC: Weight Adjustments ---
         
-        if carrying >= 5 or (food_left <= 2):
-            weights['distance_to_food'] = 0     # Ignore food
-            weights['successor_score'] = 0      # Ignore score count
-            weights['distance_to_home'] = -10   # SPRINT HOME
-            
+        if scared_ghosts:
+            # HUNT MODE
+            # We ignore food and home to prioritize eating the ghost (worth 200 points!)
+            weights['distance_to_scared_ghost'] = -150  # Strong pull towards ghost
+            weights['distance_to_food'] = 0             # Ignore regular dots
+            weights['distance_to_capsule'] = 0
+            weights['distance_to_home'] = 0
+            weights['successor_score'] = 0              # Don't get distracted by score
+        
+        elif self.retreating:
+            # RETREAT MODE
+            weights['successor_score'] = 0
+            weights['distance_to_food'] = 0
+            weights['distance_to_capsule'] = 0
+            weights['distance_to_home'] = -5 
+        
+        else:
+            # SCAVANGE MODE
+            my_state = game_state.get_agent_state(self.index)
+            if my_state.num_carrying > 0:
+                weights['distance_to_home'] = -1 
+
         return weights
-    
-
-
 
 
 class DefensiveReflexAgent(ReflexCaptureAgent):
