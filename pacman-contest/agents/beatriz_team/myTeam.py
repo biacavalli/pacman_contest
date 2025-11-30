@@ -556,7 +556,7 @@ class DefensiveReflexAgent(ReflexCaptureAgent):
         self.patrol_points = spread_points(raw_border_points, step=3)
 
         # Fallback — ensure we have at least 4 patrol points
-        if len(self.patrol_points) < 4:
+        if len(self.patrol_points) < 10:
             self.patrol_points = raw_border_points
 
         # Start at the closest point
