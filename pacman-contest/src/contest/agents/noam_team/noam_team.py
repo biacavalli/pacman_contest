@@ -273,27 +273,54 @@ class OffensiveReflexAgent(ReflexCaptureAgent):
         walls = game_state.get_walls()
         width = walls.width
         height = walls.height
-        dead_ends = set()
+        
+        # 'all_dead_ends' is used for calculation (we need to know where the tips are 
+        # to calculate the necks of the tunnels)
+        all_dead_ends = set()
+        
+        # 'dangerous_dead_ends' is what we return. We will exclude the tips (depth 1).
+        dangerous_dead_ends = set()
+        
         candidates = []
         for x in range(width):
             for y in range(height):
                 if not walls[x][y]: candidates.append((x,y))
 
         changed = True
+        depth = 0 # Track how deep we are in the tunnel
+        
         while changed:
             changed = False
+            depth += 1
+            new_dead_ends = set()
+            
             for pos in candidates:
-                if pos in dead_ends: continue
+                if pos in all_dead_ends: continue
+                
                 x, y = pos
                 neighbors = [(x+1, y), (x-1, y), (x, y+1), (x, y-1)]
                 valid_exits = 0
                 for nx, ny in neighbors:
-                    if not walls[nx][ny] and (nx, ny) not in dead_ends:
+                    # A neighbor is a valid exit if it is not a wall 
+                    # AND it has not been marked as a dead end in a previous pass
+                    if not walls[nx][ny] and (nx, ny) not in all_dead_ends:
                         valid_exits += 1
+                
                 if valid_exits <= 1:
-                    dead_ends.add(pos)
+                    new_dead_ends.add(pos)
                     changed = True
-        return dead_ends
+            
+            # Update working set so the next pass can find the next layer of the tunnel
+            all_dead_ends.update(new_dead_ends)
+            
+            # --- THE FIX ---
+            # Only mark as "Dangerous" if depth > 1.
+            # Depth 1 = The single tile at the very end (3 walls). Safe to step in and out.
+            # Depth 2+ = The corridor leading to it. Dangerous to enter.
+            if depth > 1:
+                dangerous_dead_ends.update(new_dead_ends)
+                
+        return dangerous_dead_ends
 
     def get_safe_distance_to_home(self, game_state, my_pos, dangerous_positions):
         layout = game_state.data.layout
@@ -377,13 +404,13 @@ class OffensiveReflexAgent(ReflexCaptureAgent):
             dists = [self.get_maze_distance(my_pos, g.get_position()) for g in active_ghosts]
             min_dist = min(dists)
             if min_dist < 5:
-                features['ghost_proximity'] = 5 - min_dist 
+                features['ghost_proximity'] = 5 / (min_dist * 1.5) 
                 
             for g in active_ghosts:
                 g_pos = g.get_position()
                 ix, iy = int(g_pos[0]), int(g_pos[1])
                 dangerous_spots.add((ix, iy))
-
+ 
         # Handle Scared Targets
         if scared_ghosts:
             # We want to minimize distance to the closest scared ghost
@@ -430,19 +457,8 @@ class OffensiveReflexAgent(ReflexCaptureAgent):
         # Check context
         enemies = [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]
         scared_ghosts = [a for a in enemies if not a.is_pacman and a.get_position() and a.scared_timer > 5]
-
-        # --- NEW LOGIC: Weight Adjustments ---
         
-        if scared_ghosts:
-            # HUNT MODE
-            # We ignore food and home to prioritize eating the ghost (worth 200 points!)
-            weights['distance_to_scared_ghost'] = -150  # Strong pull towards ghost
-            weights['distance_to_food'] = 0             # Ignore regular dots
-            weights['distance_to_capsule'] = 0
-            weights['distance_to_home'] = 0
-            weights['successor_score'] = 0              # Don't get distracted by score
-        
-        elif self.retreating:
+        if self.retreating:
             # RETREAT MODE
             weights['successor_score'] = 0
             weights['distance_to_food'] = 0
