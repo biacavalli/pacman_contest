@@ -1,0 +1,11 @@
+Offensive agent:
+monte carlo depth limit = 20
+one-track mind: if offensive agent decides to go home it doesn't care about food
+dead-end avoidance: avoid dead ends if ghost is nearby
+get home safe: use BFS to chart a path home, treating ghosts as walls
+no loops: track last position to avoid looping
+
+TODO:
+own territory
+fix running
+fix pellet (don't hunt, be brave)
